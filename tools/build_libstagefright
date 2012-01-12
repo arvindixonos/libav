@@ -54,5 +54,5 @@ mkdir -p $DEST
 echo $FLAGS --extra-cflags="$EXTRA_CFLAGS" --extra-ldflags="$EXTRA_LDFLAGS" --extra-cxxflags="$EXTRA_CXXFLAGS" > $DEST/info.txt
 ./configure $FLAGS --extra-cflags="$EXTRA_CFLAGS" --extra-ldflags="$EXTRA_LDFLAGS" --extra-cxxflags="$EXTRA_CXXFLAGS" | tee $DEST/configuration.txt
 [ $PIPESTATUS == 0 ] || exit 1
-make clean
+#make clean
 make -j4 || exit 1
