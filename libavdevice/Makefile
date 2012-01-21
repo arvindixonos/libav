@@ -25,6 +25,8 @@ OBJS-$(CONFIG_X11_GRAB_DEVICE_INDEV)     += x11grab.o
 
 # external libraries
 OBJS-$(CONFIG_LIBDC1394_INDEV)           += libdc1394.o
+OBJS-$(CONFIG_LIBSTAGEFRIGHT_DEVICE) 	 += libstagefright_source.o \
+					    libstagefright_source_imp.o
 
 SKIPHEADERS-$(HAVE_ALSA_ASOUNDLIB_H)     += alsa-audio.h
 SKIPHEADERS-$(HAVE_SNDIO_H)              += sndio_common.h
