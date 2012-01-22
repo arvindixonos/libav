@@ -21,6 +21,7 @@
  */
 
 #include <utils/Errors.h>
+#include <binder/IPCThreadState.h>
 #include <binder/Parcel.h>
 #include <binder/ProcessState.h>
 #include <camera/ICamera.h>
@@ -38,7 +39,6 @@
 #include <new>
 
 #include "libstagefright_source.h"
-
 using namespace android;
 
 /* TODO It is reasonable to move this function to some common header */
@@ -87,6 +87,362 @@ typedef struct {
 ////
     CameraParameters 	*params;
 } CameraContext;
+
+/*
+ * XXX: By unknown reason standard CameraSource  returns strange buffers
+ * from CameraSource::read() method (buffers with size of 16 bytes in my case).
+ * Seems this is happens due to incorrect initialization, but i dont know how
+ * to fix it. From other point of view camera preview callback interface works
+ * perfect, so let's use it.
+ * It is fun but seems like i'm not an only one who dont know how to use recording
+ * interface, OpenCV and Bambuser use same trick instead of standard camera
+ * recording interface.
+ * 								-dmonakhov@
+ */
+#define USE_CAMERA_PREVIEW_INTERFACE 1
+
+#ifdef USE_CAMERA_PREVIEW_INTERFACE
+
+#define  ASSERT_MUTEX_IS_LOCKED(_mtx_) \
+    if (!(_mtx_)->tryLock()) \
+        av_log(NULL,AV_LOG_PANIC, "%s:%d Mutex was unlocked\n", __FILE__, __LINE__);
+
+/*
+ * Queue class with external common lock.
+ * XXX: Android MediaBuffer interface is awful, nextBuffer is available only
+ * for MediaGroupBuffer, let's pretend that our clas is indeed MediaGroupBuffer
+ */
+namespace android {
+class MediaBufferGroup {
+public:
+    MediaBufferGroup(Mutex *lk): lock(lk), head(0), tail(0), is_alive(1) {}
+
+    bool empty() {return head == NULL;}
+    void setAlive(int alive) {
+        is_alive = alive;
+        condition.signal();
+    }
+    void push(MediaBuffer *buffer) {
+        ASSERT_MUTEX_IS_LOCKED(lock);
+        if (head) {
+            tail->setNextBuffer(buffer);
+        } else {
+            head = buffer;
+            condition.signal();
+        }
+        buffer->setNextBuffer(NULL);
+        tail = buffer;
+    }
+    MediaBuffer* pop(int may_block) {
+        ASSERT_MUTEX_IS_LOCKED(lock);
+        MediaBuffer* buffer = NULL;
+        while(is_alive) {
+            buffer = head;
+            if (head) {
+                head = head->nextBuffer();
+                break;
+            } else if (!may_block)
+                break;
+            condition.wait(*lock);
+        }
+        return buffer;
+    }
+    status_t erase(MediaBuffer *buffer) {
+        ASSERT_MUTEX_IS_LOCKED(lock);
+        MediaBuffer *p, *prev = head;
+        if (!head)
+            return android::NAME_NOT_FOUND;
+        if (head == buffer) {
+            head = head->nextBuffer();
+            return OK;
+        }
+        p = head->nextBuffer();
+        while(p) {
+            if (p == buffer) {
+                if (p == tail)
+                    tail = prev;
+                prev->setNextBuffer(p->nextBuffer());
+                return OK;
+            }
+            prev = p;
+            p = p->nextBuffer();
+        }
+        return android::NAME_NOT_FOUND;
+    }
+    ~MediaBufferGroup() {
+        MediaBuffer *buffer;
+        while ((buffer = head)) {
+            head = head->nextBuffer();
+            av_log(NULL, AV_LOG_DEBUG,
+                   "Destroy buffer:(%p) {data:%p ref:%d}\n", buffer,
+                   buffer->data(), buffer->refcount());
+            buffer->setObserver(NULL);
+            delete buffer;
+        }
+    }
+private:
+    Mutex *lock;
+    Condition condition;
+    MediaBuffer *head, *tail;
+    unsigned is_alive;
+};
+};
+class CameraPreviewSource : public MediaSource, public MediaBufferObserver {
+public:
+    CameraPreviewSource(const sp<Camera> &camera, void *avctx);
+
+    virtual ~CameraPreviewSource();
+    virtual status_t start(MetaData *params = NULL);
+    virtual status_t stop();
+    virtual sp<MetaData> getFormat() { return mMeta; }
+    virtual status_t read(MediaBuffer **buffer,
+                          const ReadOptions *options = NULL);
+    virtual void signalBufferReturned(MediaBuffer* buffer);
+private:
+    friend class PreviewListener;
+
+    sp<Camera> mCamera;
+    sp<MetaData> mMeta;
+    void *mAvCtx;
+    Mutex mLock;
+    MediaBufferGroup unused_queue; /* Buffers for incoming frames */
+    MediaBufferGroup ready_queue;  /* Buffers for ::read() request */
+    MediaBufferGroup busy_queue;   /* Buffers belongs to user, not yet released */
+    int64_t start_time;
+    int32_t mNumReceived;
+    int32_t mNumEncoded;
+    int32_t mNumDropped;
+    int32_t mNumFrames;
+    bool mStarted;
+    void postData(int32_t msgType, const sp<IMemory> &data);
+    CameraPreviewSource(const CameraPreviewSource &);
+    CameraPreviewSource &operator=(const CameraPreviewSource &);
+};
+
+struct PreviewListener : public CameraListener {
+    PreviewListener(const sp<CameraPreviewSource> &source): mSource(source) {}
+
+    virtual void notify(int32_t msgType, int32_t e1, int32_t e2);
+    virtual void postData(int32_t msgType, const sp<IMemory> &dataPtr);
+    virtual void postDataTimestamp(
+            nsecs_t timestamp, int32_t msgType, const sp<IMemory>& dataPtr);
+protected:
+    virtual ~PreviewListener() {};
+
+private:
+    wp<CameraPreviewSource> mSource;
+
+    PreviewListener(const PreviewListener &);
+    PreviewListener &operator=(const PreviewListener &);
+};
+
+void PreviewListener::notify(int32_t msgType, int32_t a1, int32_t a2)
+{
+    av_log(NULL, AV_LOG_DEBUG, "PreviewListener::notify(%d, %d, %d)",
+           msgType, a1, a2);
+}
+
+void PreviewListener::postData(int32_t msgType, const sp<IMemory> &dp)
+{
+    sp<CameraPreviewSource> source = mSource.promote();
+    if (source.get() != NULL)
+        source->postData(msgType, dp);
+}
+
+void PreviewListener::postDataTimestamp(nsecs_t timestamp, int32_t msgType,
+                                        const sp<IMemory>& frame) {
+    sp<CameraPreviewSource> source = mSource.promote();
+    LOGV("%s src:%p dp{%p,%d}\n", __FUNCTION__, source.get(), frame->pointer(),
+         frame->size());
+    if (source.get() && source->mCamera.get()) {
+        int64_t toc = IPCThreadState::self()->clearCallingIdentity();
+        source->mCamera->releaseRecordingFrame(frame);
+        IPCThreadState::self()->restoreCallingIdentity(toc);
+    } else {
+        /* Should never happen */
+        av_log(NULL, AV_LOG_ERROR,
+               "Release context absent, IMemory{ptr:%p, sz:%d} will leak",
+               frame->pointer(), frame->size());
+    }
+}
+
+CameraPreviewSource::CameraPreviewSource(const sp<Camera> &camera, void *avctx)
+    : mCamera(camera),
+      mAvCtx(avctx),
+      mLock(),
+      unused_queue(&mLock),
+      ready_queue(&mLock),
+      busy_queue(&mLock),
+      mNumReceived(0),
+      mNumEncoded(0),
+      mNumDropped(0),
+      mNumFrames(50),
+      mStarted(false)
+{
+
+    int64_t ipc_toc = IPCThreadState::self()->clearCallingIdentity();
+    String8 s = mCamera->getParameters();
+    IPCThreadState::self()->restoreCallingIdentity(ipc_toc);
+
+    int32_t width, height;
+    CameraParameters params(s);
+    params.getPreviewSize(&width, &height);
+
+    const char *str_pix_fmt = params.get(CameraParameters::KEY_PREVIEW_FORMAT);
+    int32_t pix_fmt = OMX_COLOR_FormatYUV420SemiPlanar;
+    if (str_pix_fmt) {
+        if (!strcmp(str_pix_fmt, CameraParameters::PIXEL_FORMAT_YUV420SP))
+            pix_fmt = OMX_COLOR_FormatYUV420SemiPlanar;
+        else if (!strcmp(str_pix_fmt, CameraParameters::PIXEL_FORMAT_YUV422SP))
+            pix_fmt = OMX_COLOR_FormatYUV422SemiPlanar;
+        else if (!strcmp(str_pix_fmt, CameraParameters::PIXEL_FORMAT_RGB565))
+            pix_fmt = OMX_COLOR_Format16bitRGB565;
+        else if (!strcmp(str_pix_fmt, CameraParameters::PIXEL_FORMAT_YUV422I))
+            pix_fmt =  OMX_COLOR_FormatYCbYCr;
+        else
+            av_log(mAvCtx, AV_LOG_ERROR, "Unknown frame format (%s)\n",
+                   str_pix_fmt);
+    }
+    mMeta = new MetaData;
+    mMeta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_RAW);
+    mMeta->setInt32(kKeyColorFormat, pix_fmt);
+    mMeta->setInt32(kKeyWidth, width);
+    mMeta->setInt32(kKeyHeight, height);
+    mMeta->setInt32(kKeyStride, width);
+    mMeta->setInt32(kKeySliceHeight, height);
+
+    int32_t frame_size  = (width * height * 3) / 2;
+    /* Lock mutex in order to satisfy queue's locking rules */
+    Mutex::Autolock autoLock(mLock);
+    for (int num = 0; num < mNumFrames; num++) {
+        MediaBuffer *buffer = new MediaBuffer(frame_size);
+        buffer->setObserver(this);
+        av_log(NULL, AV_LOG_DEBUG, "Alloc buffer:(%p) {data:%p ref:%d}\n", buffer,
+                   buffer->data(), buffer->refcount());
+        unused_queue.push(buffer);
+    }
+}
+
+CameraPreviewSource::~CameraPreviewSource()
+{
+    if (mStarted) {
+        stop();
+    }
+    /* Buffers will be destroyed by queues destructors */
+}
+status_t CameraPreviewSource::start(MetaData *meta)
+{
+    Mutex::Autolock autoLock(mLock);
+    if (mStarted)
+        return OK;
+    av_log(mAvCtx, AV_LOG_VERBOSE, "Start\n");
+    start_time = av_gettime();
+    int64_t token = IPCThreadState::self()->clearCallingIdentity();
+    mCamera->setListener(new PreviewListener(this));
+    mCamera->setPreviewCallbackFlags(FRAME_CALLBACK_FLAG_ENABLE_MASK);
+    IPCThreadState::self()->restoreCallingIdentity(token);
+    mStarted = true;
+    ready_queue.setAlive(1);
+
+    return OK;
+}
+
+status_t CameraPreviewSource::stop() {
+    MediaBuffer *buffer;
+    Mutex::Autolock autoLock(mLock);
+    if (!mStarted)
+        return OK;
+    av_log(mAvCtx, AV_LOG_VERBOSE, "Stop\n");
+    int64_t token = IPCThreadState::self()->clearCallingIdentity();
+    mCamera->setPreviewCallbackFlags(0);
+    mCamera->setListener(NULL);
+    IPCThreadState::self()->restoreCallingIdentity(token);
+
+    mStarted = false;
+    /* After that moment no one can add new buffers to ready_queue
+     * Drain all buffers to temroral queue. */
+    MediaBufferGroup tmp_queue(&mLock);
+    while (!ready_queue.empty()) {
+        buffer = ready_queue.pop(1);
+        tmp_queue.push(buffer);
+    }
+    /* Notify users which may be blocked on ready_queue that queue was stopeed */
+    ready_queue.setAlive(0);
+    while (!busy_queue.empty()) {
+        av_log(mAvCtx, AV_LOG_DEBUG, "Waiting for outstanding buffers: %d",
+               busy_queue.empty());
+        /* Released buffers will be pushed back to unsuded_queue */
+        buffer = unused_queue.pop(1);
+        tmp_queue.push(buffer);
+    }
+    /* Return buffers back to unused queue, so later start() can use it*/
+    while (!tmp_queue.empty()) {
+        buffer = tmp_queue.pop(1);
+        unused_queue.push(buffer);
+    }
+    av_log(mAvCtx, AV_LOG_DEBUG, "Queues unused/ready/busy %d/%d/%d\n",
+           unused_queue.empty(), ready_queue.empty(), busy_queue.empty());
+    av_log(mAvCtx, AV_LOG_VERBOSE, "Frames received/encoded/dropped: "
+           "%d/%d/%d in %lld us",
+           mNumReceived, mNumEncoded, mNumDropped,
+           av_gettime() - start_time);
+    return OK;
+}
+
+void CameraPreviewSource::signalBufferReturned(MediaBuffer *buffer) {
+    Mutex::Autolock autoLock(mLock);
+    av_log(mAvCtx, AV_LOG_DEBUG, "signalBufferReturned: %p", buffer->data());
+    if (busy_queue.erase(buffer) != OK) {
+        av_log(mAvCtx, AV_LOG_ERROR, "signalBufferReturned: bogus buffer{%p,%d}",
+               buffer->data(), buffer->refcount());
+        return;
+    }
+    unused_queue.push(buffer);
+}
+
+status_t CameraPreviewSource::read(MediaBuffer **buffer, const ReadOptions *op)
+{
+    Mutex::Autolock autoLock(mLock);
+    if (!mStarted)
+        return OK;
+    av_log(mAvCtx, AV_LOG_DEBUG, "read\n");
+    *buffer = ready_queue.pop(1);
+    if (*buffer) {
+        mNumEncoded++;
+        (*buffer)->add_ref();
+        busy_queue.push(*buffer);
+    }
+    return OK;
+}
+
+void CameraPreviewSource::postData(int32_t msgType, const sp<IMemory> &data)
+{
+//    LOGV("%s started:%d dp{%p,%d}\n", __FUNCTION__, mStarted, data->pointer(), data->size());
+    if (!mStarted)
+        return;
+    int64_t timestampUs = av_gettime();
+
+    Mutex::Autolock autoLock(mLock);
+    av_log(mAvCtx, AV_LOG_DEBUG, "postData: timestamp %lld us",
+           timestampUs - start_time);
+    if (!mStarted)
+        return;
+    mNumReceived++;
+    MediaBuffer *buffer = unused_queue.pop(0);
+    if (!buffer) {
+        av_log(mAvCtx, AV_LOG_VERBOSE, "Failed to get unused buffer, will drop\n");
+        mNumDropped++;
+        return;
+    }
+    assert(buffer->size() == data->size());
+    memcpy(buffer->data(), data->pointer(), data->size());
+    buffer->set_range(0, data->size());
+    buffer->meta_data()->clear();
+    buffer->meta_data()->setInt64(kKeyTime, timestampUs - start_time);
+    ready_queue.push(buffer);
+}
+
+#endif /* USE_CAMERA_PREVIEW_INTERFACE */
 
 static void sf_source_destroy(AVFormatContext *s, MediaSourceContext *src_ctx)
 {
@@ -208,6 +564,7 @@ void sf_audio_destroy(AudioSourceContext *ctx)
     }
 }
 
+
 int sf_camera_init(CameraSourceContext *ctx)
 {
     MediaSourceContext *src_ctx = (MediaSourceContext*) ctx->src_ctx;
@@ -225,34 +582,25 @@ int sf_camera_init(CameraSourceContext *ctx)
                "CameraSource context is already initialized\n");
         return EBUSY;
     }
+    ProcessState::self()->startThreadPool();
     cam_ctx = new CameraContext();
-    /* Initialize preview surface */
-    if (ctx->pv_parcel.size == 0) {
-        /* Create default preview surface */
-        cam_ctx->pv_client = new SurfaceComposerClient();
-        cam_ctx->pv_control = cam_ctx->pv_client->createSurface(
-            getpid(), 0, ctx->pv_width, ctx->pv_height,
-            PIXEL_FORMAT_RGB_565, 0x00000200);
-        if (!cam_ctx->pv_control.get())
-            goto fail;
-        if (ctx->preview_enable) {
-            cam_ctx->pv_client->openTransaction();
-            cam_ctx->pv_control->setLayer(100000);
-            cam_ctx->pv_client->closeTransaction();
-        }
-        parcel.setDataPosition(0);
-        SurfaceControl::writeSurfaceToParcel(cam_ctx->pv_control, &parcel);
-    } else {
-        /* User want to use explicit surface as a preview display */
+    /* User want to use explicit surface as a preview display */
+    if (ctx->pv_parcel.size != 0) {
         void* raw;
         parcel.setDataSize(ctx->pv_parcel.size);
         parcel.setDataPosition(0);
         raw = parcel.writeInplace(ctx->pv_parcel.size);
         memcpy(raw, (ctx->pv_parcel.data), ctx->pv_parcel.size);
+        /*
+         * TODO: Following line refused to work for me by unknown reason
+         * when compiled via standard Makefile, but it is works when built same
+         * code via $NDK/ndk-buil script. Let's hope that compile script will
+         * be fixed some day.
+         */
+        cam_ctx->pv_surface = Surface::readFromParcel(parcel);
+        if (!cam_ctx->pv_surface.get())
+            goto fail;
     }
-    cam_ctx->pv_surface = Surface::readFromParcel(parcel);
-    if (!cam_ctx->pv_surface.get())
-        goto fail;
 
     /* Initialize camera context */
     cam_ctx->camera = android::Camera::connect(ctx->device_idx);
@@ -286,7 +634,13 @@ int sf_camera_init(CameraSourceContext *ctx)
         goto fail;
     }
     src_ctx = new MediaSourceContext();
+#ifdef USE_CAMERA_PREVIEW_INTERFACE
+    src_ctx->source = new CameraPreviewSource(cam_ctx->camera, ctx->fmt_ctx);
+    src_ctx->copy_mem = 0;
+#else /* Use standard CameraSource interface */
     src_ctx->source = android::CameraSource::CreateFromCamera(cam_ctx->camera);
+    src_ctx->copy_mem = 1;
+#endif
     fmt_meta =  src_ctx->source->getFormat();
     if (!fmt_meta->findCString(kKeyMIMEType, &mime_type) ||
         !fmt_meta->findInt32(kKeyColorFormat, &color_fmt) ||
@@ -310,7 +664,6 @@ int sf_camera_init(CameraSourceContext *ctx)
     ctx->frame_size  = (ctx->width * ctx->height * 3) / 2;
     ctx->time_base = (AVRational){1, 30};
     src_ctx->init = 1;
-    src_ctx->copy_mem = 1;
     /* Finally attach smart pointers to context, after that context will owns
      * it's smartpointers */
     ctx->src_ctx = src_ctx;
