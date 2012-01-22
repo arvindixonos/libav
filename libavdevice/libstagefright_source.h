@@ -39,10 +39,32 @@ extern "C" {
         void *src_ctx;	 		/* MediaSourceCtx struct */
     } AudioSourceContext;
 
+    typedef struct {
+        char *data;
+        size_t size;
+    } ParcelInfo;
+    typedef struct {
+        AVFormatContext *fmt_ctx;
+        uint32_t device_idx;
+        uint32_t height;
+        uint32_t width;
+        uint32_t pv_height;
+        uint32_t pv_width;
+        ParcelInfo pv_parcel;
+        enum CodecID codec_id;
+        enum PixelFormat pix_fmt;
+        uint32_t frame_size;
+        AVRational time_base;
+        void *src_ctx;	 		/* MediaSourceCtx struct */
+        void *cam_ctx;
+        unsigned int preview_enable;
+    } CameraSourceContext;
+
     int sf_audio_init(AudioSourceContext *c);
     int sf_read_packet(AVFormatContext *s, void *src_ctx,  AVPacket *pkt);
     void sf_audio_destroy(AudioSourceContext *c);
-
+    int sf_camera_init(CameraSourceContext *c);
+    void sf_camera_destroy(CameraSourceContext *c);
 #ifdef __cplusplus
 }
 #endif

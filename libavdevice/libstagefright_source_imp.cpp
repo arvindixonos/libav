@@ -21,12 +21,20 @@
  */
 
 #include <utils/Errors.h>
+#include <binder/Parcel.h>
 #include <binder/ProcessState.h>
+#include <camera/ICamera.h>
+#include <camera/CameraParameters.h>
 #include <media/stagefright/MediaDebug.h>
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/MediaBuffer.h>
 #include <media/stagefright/AudioSource.h>
+#include <media/stagefright/CameraSource.h>
+#include <media/stagefright/openmax/OMX_IVCommon.h>
+#include <surfaceflinger/Surface.h>
+#include <surfaceflinger/SurfaceComposerClient.h>
+
 #include <new>
 
 #include "libstagefright_source.h"
@@ -67,6 +75,18 @@ typedef struct
     unsigned int started:1;	/* Source was successully started */
     unsigned int copy_mem:1;	/* Copy packet's data required */
 } MediaSourceContext;
+
+typedef struct {
+    /* Preview context */
+    sp<SurfaceComposerClient> 	pv_client;
+    sp<SurfaceControl> 		pv_control;
+    sp<Surface> 		pv_surface;
+    /* Camera context */
+    sp<Camera> 			camera;
+    sp<ICamera> 		icamera;
+////
+    CameraParameters 	*params;
+} CameraContext;
 
 static void sf_source_destroy(AVFormatContext *s, MediaSourceContext *src_ctx)
 {
@@ -186,4 +206,139 @@ void sf_audio_destroy(AudioSourceContext *ctx)
         sf_source_destroy(ctx->fmt_ctx, src_ctx);
         ctx->src_ctx = NULL;
     }
+}
+
+int sf_camera_init(CameraSourceContext *ctx)
+{
+    MediaSourceContext *src_ctx = (MediaSourceContext*) ctx->src_ctx;
+    CameraContext *cam_ctx = (CameraContext *) ctx->cam_ctx;
+    android::String8 params_str;
+    sp<MetaData> fmt_meta;
+    status_t err = UNKNOWN_ERROR;
+    Parcel parcel;
+    int32_t color_fmt, width, height;
+    const char *mime_type;
+    char tmp_str[32];
+
+    if (src_ctx != NULL || cam_ctx != NULL) {
+        av_log(ctx->fmt_ctx, AV_LOG_ERROR,
+               "CameraSource context is already initialized\n");
+        return EBUSY;
+    }
+    cam_ctx = new CameraContext();
+    /* Initialize preview surface */
+    if (ctx->pv_parcel.size == 0) {
+        /* Create default preview surface */
+        cam_ctx->pv_client = new SurfaceComposerClient();
+        cam_ctx->pv_control = cam_ctx->pv_client->createSurface(
+            getpid(), 0, ctx->pv_width, ctx->pv_height,
+            PIXEL_FORMAT_RGB_565, 0x00000200);
+        if (!cam_ctx->pv_control.get())
+            goto fail;
+        if (ctx->preview_enable) {
+            cam_ctx->pv_client->openTransaction();
+            cam_ctx->pv_control->setLayer(100000);
+            cam_ctx->pv_client->closeTransaction();
+        }
+        parcel.setDataPosition(0);
+        SurfaceControl::writeSurfaceToParcel(cam_ctx->pv_control, &parcel);
+    } else {
+        /* User want to use explicit surface as a preview display */
+        void* raw;
+        parcel.setDataSize(ctx->pv_parcel.size);
+        parcel.setDataPosition(0);
+        raw = parcel.writeInplace(ctx->pv_parcel.size);
+        memcpy(raw, (ctx->pv_parcel.data), ctx->pv_parcel.size);
+    }
+    cam_ctx->pv_surface = Surface::readFromParcel(parcel);
+    if (!cam_ctx->pv_surface.get())
+        goto fail;
+
+    /* Initialize camera context */
+    cam_ctx->camera = android::Camera::connect(ctx->device_idx);
+    if (!cam_ctx->camera.get()) {
+        av_log(ctx->fmt_ctx, AV_LOG_ERROR, "Can not connect to camera :%d\n",
+            ctx->device_idx);
+        goto fail;
+    }
+    params_str = cam_ctx->camera->getParameters();
+    cam_ctx->params = new android::CameraParameters(params_str);
+    /* Strage old sources has no ->setVideoSize() */
+    snprintf(tmp_str, sizeof(tmp_str), "%dx%d", ctx->width, ctx->height);
+    cam_ctx->params->set("video-size", tmp_str);
+    cam_ctx->params->setPreviewSize(ctx->pv_width, ctx->pv_height);
+    err = cam_ctx->camera->setParameters(cam_ctx->params->flatten());
+    if (err != OK) {
+        av_log(ctx->fmt_ctx, AV_LOG_ERROR,
+               "Set camera parameters failed with: %d\n", err);
+        goto fail;
+    }
+    err = cam_ctx->camera->setPreviewDisplay(cam_ctx->pv_surface);
+    if (err != OK) {
+        av_log(ctx->fmt_ctx, AV_LOG_ERROR,
+               "Set camera preview display failed with: %d\n", err);
+        goto fail;
+    }
+    err = cam_ctx->camera->startPreview();
+    if (err != OK) {
+        av_log(ctx->fmt_ctx, AV_LOG_ERROR,
+               "startPreview failed with: %d\n", err);
+        goto fail;
+    }
+    src_ctx = new MediaSourceContext();
+    src_ctx->source = android::CameraSource::CreateFromCamera(cam_ctx->camera);
+    fmt_meta =  src_ctx->source->getFormat();
+    if (!fmt_meta->findCString(kKeyMIMEType, &mime_type) ||
+        !fmt_meta->findInt32(kKeyColorFormat, &color_fmt) ||
+        !fmt_meta->findInt32(kKeyWidth, &width) ||
+        !fmt_meta->findInt32(kKeyHeight, &height))
+        goto fail;
+
+    if (strcasecmp(mime_type, MEDIA_MIMETYPE_VIDEO_RAW))
+        goto fail;
+    ctx->codec_id = CODEC_ID_RAWVIDEO;
+    /* TODO Not shure that following lines are coorect */
+    av_log(ctx->fmt_ctx, AV_LOG_VERBOSE, "camera pixel format: %x\n", color_fmt);
+    if (color_fmt == OMX_COLOR_FormatYUV420SemiPlanar)
+        ctx->pix_fmt = PIX_FMT_NV21;
+    else
+        ctx->pix_fmt = PIX_FMT_YUV420P;
+
+    ctx->width = width;
+    ctx->height = height;
+    /* TODO Determinate framesize from pixel format */
+    ctx->frame_size  = (ctx->width * ctx->height * 3) / 2;
+    ctx->time_base = (AVRational){1, 30};
+    src_ctx->init = 1;
+    src_ctx->copy_mem = 1;
+    /* Finally attach smart pointers to context, after that context will owns
+     * it's smartpointers */
+    ctx->src_ctx = src_ctx;
+    ctx->cam_ctx = cam_ctx;
+
+    return 0;
+fail:
+    /* Nothing special should be done here because all objects allocated are owned
+     * by smart pointers and will be automatically destroyed by destructors */
+    if (src_ctx)
+        delete src_ctx;
+    if (cam_ctx) {
+        if (cam_ctx->params)
+            delete cam_ctx->params;
+        delete cam_ctx;
+    }
+    return err;
+}
+
+void sf_camera_destroy(CameraSourceContext *ctx)
+{
+    CameraContext *cam_ctx = (CameraContext*) ctx->cam_ctx;
+    MediaSourceContext *src_ctx = (MediaSourceContext*) ctx->src_ctx;
+
+    if (!src_ctx) {
+        sf_source_destroy(ctx->fmt_ctx, src_ctx);
+        ctx->src_ctx = NULL;
+    }
+    delete cam_ctx;
+    ctx->cam_ctx = NULL;
 }

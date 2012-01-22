@@ -1520,6 +1520,7 @@ fbdev_indev_deps="linux_fb_h"
 jack_indev_deps="jack_jack_h"
 libdc1394_indev_deps="libdc1394"
 libstagefright_audio_indev_deps="libstagefright libstagefright_device"
+libstagefright_camera_indev_deps="libstagefright libstagefright_device"
 oss_indev_deps_any="soundcard_h sys_soundcard_h"
 oss_outdev_deps_any="soundcard_h sys_soundcard_h"
 sndio_indev_deps="sndio_h"
@@ -2956,7 +2957,8 @@ enabled libschroedinger && require_pkg_config schroedinger-1.0 schroedinger/schr
 enabled libspeex   && require  libspeex speex/speex.h speex_decoder_init -lspeex
 enabled libstagefright  && require_cpp libstagefright "binder/ProcessState.h media/stagefright/MetaData.h
     media/stagefright/MediaBufferGroup.h media/stagefright/MediaDebug.h media/stagefright/MediaDefs.h
-    media/stagefright/AudioSource.h
+    media/stagefright/AudioSource.h binder/Parcel.h camera/Camera.h camera/CameraParameters.h
+    media/stagefright/CameraSource.h surfaceflinger/Surface.h surfaceflinger/SurfaceComposerClient.h
     media/stagefright/OMXClient.h media/stagefright/OMXCodec.h" android::OMXClient -lstagefright -lmedia -lutils -lbinder
 enabled libtheora  && require  libtheora theora/theoraenc.h th_info_init -ltheoraenc -ltheoradec -logg
 enabled libvo_aacenc && require libvo_aacenc vo-aacenc/voAAC.h voGetAACEncAPI -lvo-aacenc

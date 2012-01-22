@@ -8,6 +8,7 @@ fi
 echo "Fetching Android system headers"
 git clone --depth=1 --branch gingerbread-release git://github.com/CyanogenMod/android_frameworks_base.git ../android-source/frameworks/base
 git clone --depth=1 --branch gingerbread-release git://github.com/CyanogenMod/android_system_core.git ../android-source/system/core
+git clone --depth=1 --branch gingerbread git://github.com/CyanogenMod/android_hardware_libhardware.git ../android-source/hardware
 
 echo "Fetching Android libraries for linking"
 # Libraries from any froyo/gingerbread device/emulator should work
@@ -41,6 +42,7 @@ FLAGS="$FLAGS --enable-avdevice --disable-outdevs --disable-indev=v4l --disable-
 EXTRA_CFLAGS="-I$ANDROID_SOURCE/frameworks/base/include -I$ANDROID_SOURCE/system/core/include"
 EXTRA_CFLAGS="$EXTRA_CFLAGS -I$ANDROID_SOURCE/frameworks/base/media/libstagefright"
 EXTRA_CFLAGS="$EXTRA_CFLAGS -I$ANDROID_SOURCE/frameworks/base/include/media/stagefright/openmax"
+EXTRA_CFLAGS="$EXTRA_CFLAGS -I$ANDROID_SOURCE/hardware/include"
 EXTRA_CFLAGS="$EXTRA_CFLAGS -I$NDK/sources/cxx-stl/system/include"
 
 EXTRA_CFLAGS="$EXTRA_CFLAGS -march=armv7-a -mfloat-abi=softfp -mfpu=neon"

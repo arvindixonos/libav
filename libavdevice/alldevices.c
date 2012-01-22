@@ -56,4 +56,5 @@ void avdevice_register_all(void)
     /* external libraries */
     REGISTER_INDEV    (LIBDC1394, libdc1394);
     REGISTER_INDEV    (LIBSTAGEFRIGHT_AUDIO, libstagefright_audio);
+    REGISTER_INDEV    (LIBSTAGEFRIGHT_CAMERA, libstagefright_camera);
 }
